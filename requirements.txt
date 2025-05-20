@@ -1,0 +1,8 @@
+streamlit
+opensearch-py
+python-dotenv
+pydantic-ai
+autogen
+autogen-ext[openai]
+autogen-agentchat
+autogen-core
