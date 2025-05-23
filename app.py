@@ -46,28 +46,77 @@ model_client = OpenAIChatCompletionClient(
 # Singleton pattern for OpenSearch client
 opensearch_client = None
 
+def extract_fields_info(properties, parent_prefix=""):
+    """Recursively extract field names and types from OpenSearch mappings"""
+    fields_info = {}
+
+    for field, prop in properties.items():
+        full_path = f"{parent_prefix}{field}"
+
+        # Check if this is a nested object with its own properties
+        if "properties" in prop:
+            # Add this field as an object type
+            fields_info[full_path] = "object"
+            # Add all nested fields with proper path
+            nested_fields = extract_fields_info(prop["properties"], f"{full_path}.")
+            fields_info.update(nested_fields)
+        else:
+            # It's a primitive field
+            field_type = prop.get("type", "unknown")
+            fields_info[full_path] = field_type
+
+    return fields_info
+
+# def clean_json_response(response):
+#     """
+#     Cleans the response from LLM to ensure it's valid JSON.
+#     Removes markdown code blocks, comments, and extra whitespace.
+#     """
+#     # Remove markdown code blocks if present
+#     response = re.sub(r'(?:json)?\s*([\s\S]*?)\s*', r'\1', response)
+    
+#     # Remove any JSON comments
+#     response = re.sub(r'//.*', '', response)
+    
+#     # Look for the first { and last }
+#     json_start = response.find('{')
+#     json_end = response.rfind('}')
+    
+#     if json_start != -1 and json_end != -1:
+#         response = response[json_start:json_end+1]
+    
+#     try:
+#         return json.loads(response.strip())
+#     except json.JSONDecodeError:
+#         return None
+
 def clean_json_response(response):
     """
     Cleans the response from LLM to ensure it's valid JSON.
-    Removes markdown code blocks, comments, and extra whitespace.
+    Removes markdown code blocks, comments, and extra whitespace while preserving the JSON structure.
     """
-    # Remove markdown code blocks if present
-    response = re.sub(r'(?:json)?\s*([\s\S]*?)\s*', r'\1', response)
+    # Remove markdown code block markers (e.g., ```json or ```)
+    response = re.sub(r'^```(?:json)?\s*\n|\n```$', '', response, flags=re.MULTILINE)
     
-    # Remove any JSON comments
-    response = re.sub(r'//.*', '', response)
+    # Remove any JSON comments (e.g., // comment)
+    response = re.sub(r'//.*$', '', response, flags=re.MULTILINE)
     
-    # Look for the first { and last }
+    # Remove leading/trailing whitespace
+    response = response.strip()
+    
+    # Extract the first valid JSON object (between { and })
     json_start = response.find('{')
     json_end = response.rfind('}')
     
-    if json_start != -1 and json_end != -1:
+    if json_start != -1 and json_end != -1 and json_end > json_start:
         response = response[json_start:json_end+1]
+    else:
+        # If no valid JSON object is found, raise an error
+        raise ValueError("No valid JSON object found in the response")
     
-    try:
-        return json.loads(response.strip())
-    except json.JSONDecodeError:
-        return None
+    return response
+    
+    return response
 
 def get_opensearch_client():
     global opensearch_client
@@ -97,8 +146,10 @@ def nl_to_opensearch_query(question, index_name):
     
     # Extract field names and types
     properties = mapping[index_name]['mappings'].get('properties', {})
-    fields_info = {field: prop.get('type', 'unknown') 
-                  for field, prop in properties.items()}
+    # fields_info = {field: prop.get('type', 'unknown') 
+    #               for field, prop in properties.items()}
+    fields_info = extract_fields_info(properties)
+
     
     # Create AutoGen agent
     agent = AssistantAgent(
@@ -108,7 +159,7 @@ def nl_to_opensearch_query(question, index_name):
         You are an AI assistant that translates natural language questions into OpenSearch queries.
         
         The OpenSearch index has the following fields and types:
-        {json.dumps(fields_info, indent=2)}
+        {fields_info}
         
         Convert the user's question into a valid OpenSearch query. Focus on creating either:
         1. A match or multi_match query for simple searches
@@ -146,7 +197,7 @@ def nl_to_opensearch_query(question, index_name):
         response = result.messages[1].content
         cleaned_response = clean_json_response(response)
         if cleaned_response:
-            return cleaned_response
+            return json.loads(cleaned_response)
         else:
             st.error("Failed to parse the generated OpenSearch query")
             return None
