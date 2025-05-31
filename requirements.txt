@@ -6,3 +6,5 @@ autogen
 autogen-ext[openai]
 autogen-agentchat
 autogen-core
+scikit-learn
+openai

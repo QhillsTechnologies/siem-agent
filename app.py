@@ -7,6 +7,8 @@ import json
 import re
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from dotenv import load_dotenv
+from desc_find import example_usage
+from fetch_rules_wazuh import fetch_wazuh_rules_descriptions
 
 load_dotenv()
 
@@ -46,6 +48,99 @@ model_client = OpenAIChatCompletionClient(
 # Singleton pattern for OpenSearch client
 opensearch_client = None
 
+def load_rule_descriptions(question):
+    """
+    Load and extract descriptions from the JSON file.
+    Returns a list of unique descriptions.
+    """
+    json_file_path="wazuh_rules.json"
+    try:
+        # with open(json_file_path, 'r', encoding='utf-8') as file:
+        #     data = json.load(file)
+        
+        # descriptions = []
+        # for rule in data:
+        #     description = rule.get('description', '').strip()
+        #     if description and description not in descriptions:
+        #         descriptions.append(description)
+        descriptions = fetch_wazuh_rules_descriptions()
+        final_descriptions = example_usage(descriptions, question)
+        return final_descriptions
+    except Exception as e:
+        st.error(f"Error loading rule descriptions: {str(e)}")
+        return []
+
+def find_relevant_rule_description(question, descriptions):
+    """
+    Use LLM to identify if the question is related to rules/descriptions
+    and return the most relevant description.
+    """
+    if not descriptions:
+        return None
+    
+    # Create AutoGen agent for rule identification
+    agent = AssistantAgent(
+        name="RuleIdentifier",
+        model_client=model_client,
+        system_message=f"""
+        You are an AI assistant that identifies if a user question specifically needs rule descriptions for searching.
+        
+        Available rule descriptions:
+        {json.dumps(descriptions, indent=2)}
+        
+        IMPORTANT: Only return a rule description if the user is asking about:
+        1. Rule content/behavior (what does a rule do, how does it work)
+        3. Rule templates or generic rule information
+        4. Security rule explanations or descriptions
+        
+        DO NOT return a rule description if the user is asking about:
+        1. Specific rule IDs (e.g., "rule ID", "rule with ID", "id equals")
+        2. Rule levels, status, or other metadata fields
+        3. Specific numerical or field-based queries
+        4. Alerts, logs, or events with specific rule identifiers
+        
+        Return a JSON response with the following format:
+        {{
+            "is_rule_related": true/false,
+            "relevant_description": "exact description from the list or null",
+        }}
+        
+        
+        Return ONLY valid JSON, no additional text or formatting.
+        """
+    )
+    
+    prompt = f"""
+    Analyze this user question and determine if it specifically needs rule descriptions for searching:
+    
+    Question: {question}
+    
+    Consider:
+    - Does this ask about rule content, behavior, or categories?
+    - Or does this ask about specific rule IDs, levels, or metadata fields?
+    - Questions about specific IDs, numbers, or field values should NOT use descriptions.
+    
+    Return JSON response indicating if rule descriptions are needed and which one.
+    """
+    
+    async def run_agent():
+        result = await agent.run(task=prompt)
+        return result
+    
+    try:
+        result = asyncio.run(run_agent())
+        response = result.messages[1].content
+        cleaned_response = clean_json_response(response)
+        rule_info = json.loads(cleaned_response)
+        
+        if rule_info.get('is_rule_related', False):
+            return rule_info.get('relevant_description')
+        return None
+        
+    except Exception as e:
+        st.error(f"Error identifying rule relevance: {str(e)}")
+        return None
+
 def extract_fields_info(properties, parent_prefix=""):
     """Recursively extract field names and types from OpenSearch mappings"""
     fields_info = {}
@@ -66,29 +161,6 @@ def extract_fields_info(properties, parent_prefix=""):
             fields_info[full_path] = field_type
 
     return fields_info
-
-# def clean_json_response(response):
-#     """
-#     Cleans the response from LLM to ensure it's valid JSON.
-#     Removes markdown code blocks, comments, and extra whitespace.
-#     """
-#     # Remove markdown code blocks if present
-#     response = re.sub(r'(?:json)?\s*([\s\S]*?)\s*', r'\1', response)
-    
-#     # Remove any JSON comments
-#     response = re.sub(r'//.*', '', response)
-    
-#     # Look for the first { and last }
-#     json_start = response.find('{')
-#     json_end = response.rfind('}')
-    
-#     if json_start != -1 and json_end != -1:
-#         response = response[json_start:json_end+1]
-    
-#     try:
-#         return json.loads(response.strip())
-#     except json.JSONDecodeError:
-#         return None
 
 def clean_json_response(response):
     """
@@ -115,14 +187,11 @@ def clean_json_response(response):
         raise ValueError("No valid JSON object found in the response")
     
     return response
-    
-    return response
 
 def get_opensearch_client():
     global opensearch_client
     
     if opensearch_client is None:
-        
         # Initialize OpenSearch client
         opensearch_client = OpenSearch(
             hosts=[{'host': opensearch_endpoint, 'port': port}],
@@ -135,7 +204,7 @@ def get_opensearch_client():
     return opensearch_client
 
 # Function to translate natural language to OpenSearch query using AutoGen
-def nl_to_opensearch_query(question, index_name):
+def nl_to_opensearch_query(question, index_name, rule_description=None):
     if not openai_api_key:
         st.warning("OpenAI API key not found in environment variables")
         return None
@@ -146,25 +215,36 @@ def nl_to_opensearch_query(question, index_name):
     
     # Extract field names and types
     properties = mapping[index_name]['mappings'].get('properties', {})
-    # fields_info = {field: prop.get('type', 'unknown') 
-    #               for field, prop in properties.items()}
     fields_info = extract_fields_info(properties)
 
+    # Enhanced system message with rule description context
+    rule_context = ""
+    if rule_description:
+        rule_context = f"""
+        
+        IMPORTANT: The user's question is related to this specific rule description:
+        "{rule_description}"
+        
+        When constructing the query, use this rule description in your search criteria.
+        If there's a 'description' field in the index, include a match query for this specific description.
+        """
     
     # Create AutoGen agent
     agent = AssistantAgent(
         name="QueryTranslator",
-        model_client=model_client,  # Use the model_client here, not the OpenSearch client
+        model_client=model_client,
         system_message=f"""
         You are an AI assistant that translates natural language questions into OpenSearch queries.
         
         The OpenSearch index has the following fields and types:
         {fields_info}
+        {rule_context}
         
         Convert the user's question into a valid OpenSearch query. Focus on creating either:
         1. A match or multi_match query for simple searches
         2. A bool query with must/should/must_not for more complex conditions
         3. Add sort, size, or other parameters as needed
+        4. If a rule description is provided, incorporate it into the search criteria
         
         Return ONLY a valid JSON string containing the OpenSearch query body, with no additional text, code fences, or comments.
         
@@ -175,11 +255,21 @@ def nl_to_opensearch_query(question, index_name):
         """
     )
     
+    # Enhanced prompt with rule description context
+    rule_prompt_context = ""
+    if rule_description:
+        rule_prompt_context = f"""
+        
+        Context: This question is related to the rule description: "{rule_description}"
+        Please incorporate this rule description into your OpenSearch query construction.
+        """
+    
     # Prompt for the agent
     prompt = f"""
     Convert the following natural language question into a valid OpenSearch query:
     
     Question: {question}
+    {rule_prompt_context}
     
     Index fields and types:
     {json.dumps(fields_info, indent=2)}
@@ -190,6 +280,7 @@ def nl_to_opensearch_query(question, index_name):
     # Run the agent
     async def run_agent():
         result = await agent.run(task=prompt)
+        # print("res: ",result)
         return result
     
     try:
@@ -205,8 +296,8 @@ def nl_to_opensearch_query(question, index_name):
         st.error(f"Error generating OpenSearch query: {str(e)}")
         return None
 
-# Function to format OpenSearch results as natural language using AutoGel
-def format_results_as_natural_language(results, question):
+# Function to format OpenSearch results as natural language using AutoGen
+def format_results_as_natural_language(results, question, rule_description=None):
     if not openai_api_key:
         st.warning("OpenAI API key not found in environment variables")
         return None
@@ -221,11 +312,20 @@ def format_results_as_natural_language(results, question):
         source = hit.get('_source', {})
         formatted_hits.append(source)
     
+    # Rule context for response formatting
+    rule_context = ""
+    if rule_description:
+        rule_context = f"""
+        
+        Note: This query was related to the rule description: "{rule_description}"
+        Please mention this context in your summary when relevant.
+        """
+    
     # Create AutoGen agent
     agent = AssistantAgent(
         name="ResultFormatter",
-        model_client=model_client,  # Use the model_client here, not the OpenSearch client
-        system_message="""
+        model_client=model_client,
+        system_message=f"""
         You are an AI assistant that summarizes OpenSearch query results into natural language.
         
         Given the user's question and the search results, create a clear, concise summary that:
@@ -233,6 +333,7 @@ def format_results_as_natural_language(results, question):
         2. Highlights the most relevant information
         3. Mentions how many results were found in total
         4. Provides specific data points from the results when relevant
+        5. If rule description context is provided, mention it appropriately
         
         Be conversational but informative. If no results were found, suggest possible reasons and alternative queries.
         
@@ -245,6 +346,7 @@ def format_results_as_natural_language(results, question):
     Summarize the following OpenSearch query results into natural language:
     
     Question: {question}
+    {rule_context}
     
     Total results found: {total_hits}
     
@@ -271,8 +373,21 @@ def format_results_as_natural_language(results, question):
 def process_question(question, selected_index):
     with st.status("Processing your question...", expanded=True) as status:
         st.write(f"Using index: {selected_index}")
+        
+        # Load rule descriptions and check if question is rule-related
+        st.write("Checking if question is related to rules...")
+        descriptions = load_rule_descriptions(question)
+        relevant_rule_description = find_relevant_rule_description(question, descriptions)
+        
+        if relevant_rule_description:
+            st.write(f"✅ Rule-related question detected!")
+            st.write(f"Relevant rule: {relevant_rule_description}")
+        else:
+            st.write("ℹ️ General question (not rule-specific)")
+        
         st.write("Translating to OpenSearch query...")
-        query = nl_to_opensearch_query(question, selected_index)
+        query = nl_to_opensearch_query(question, selected_index, relevant_rule_description)
+        
         if query:
             st.write("Query generated:")
             st.code(json.dumps(query, indent=2))
@@ -286,7 +401,7 @@ def process_question(question, selected_index):
                 )
                 
                 st.write("Generating natural language response...")
-                response = format_results_as_natural_language(results, question)
+                response = format_results_as_natural_language(results, question, relevant_rule_description)
                 status.update(label="Complete!", state="complete")
                 return response
                 
@@ -317,7 +432,7 @@ else:
             )
             
             question = st.text_input("Ask a question about your data:", 
-                                    placeholder="Example: What are the top 5 products by sales?")
+                                    placeholder="Example: What are the top 5 products by sales? or Show me firewall rules")
             
             if question and selected_index:
                 with st.container(border=True):
