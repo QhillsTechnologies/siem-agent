@@ -8,3 +8,6 @@ autogen-agentchat
 autogen-core
 scikit-learn
 openai
+langchain
+langchain-community
+langchain-core

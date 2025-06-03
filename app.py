@@ -7,10 +7,12 @@ import json
 import re
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from dotenv import load_dotenv
-from desc_find import example_usage
+from desc_find import example_usage, OpenAISemanticMatcher
 from fetch_rules_wazuh import fetch_wazuh_rules_descriptions
 
+
 load_dotenv()
+matcher = OpenAISemanticMatcher()
 
 # Set page configuration
 st.set_page_config(
@@ -66,6 +68,24 @@ def load_rule_descriptions(question):
         descriptions = fetch_wazuh_rules_descriptions()
         final_descriptions = example_usage(descriptions, question)
         return final_descriptions
+    except Exception as e:
+        st.error(f"Error loading rule descriptions: {str(e)}")
+        return []
+    
+def load_rule_descriptions_v2():
+    """
+    Load and extract descriptions from the JSON file.
+    Returns a list of unique descriptions.
+    """
+    json_file_path="wazuh_rules.json"
+    try:
+        descriptions = fetch_wazuh_rules_descriptions()
+        embeddings = matcher.create_store_descriptions(descriptions)
+        print("MEBDDINGS: ", embeddings)
+        if len(embeddings) > 0:
+            return True
+        
+        return False
     except Exception as e:
         st.error(f"Error loading rule descriptions: {str(e)}")
         return []
@@ -426,7 +446,7 @@ def process_question(question, selected_index):
         
         # Load rule descriptions and check if question is rule-related
         st.write("Checking if question is related to rules...")
-        descriptions = load_rule_descriptions(question)
+        descriptions = example_usage(question)
         relevant_rule_description = find_relevant_rule_description(question, descriptions)
         
         if relevant_rule_description:
@@ -463,37 +483,76 @@ def process_question(question, selected_index):
             status.update(label="Failed to generate query", state="error")
             return "I couldn't translate your question into a valid OpenSearch query. Please try rephrasing or check your configuration."
 
-# Main interface
+# Function to handle descriptions upload (placeholder for your custom function)
+def handle_descriptions_upload():
+    """
+    Placeholder function for handling descriptions upload.
+    Replace this with your custom logic.
+    """
+    try:
+        load_desc = load_rule_descriptions_v2()
+
+        if(load_desc == True ):
+            return True
+        return False
+        
+    except Exception as e:
+        st.error(f"Error processing descriptions: {str(e)}")
+        return False
+
+# Create tabs
 st.divider()
 
-if not openai_api_key:
-    st.error("OPENAI_API_KEY environment variable is not set")
+# Create two tabs
+tab1, tab2 = st.tabs(["💬 Chat Interface", "📤 Upload Descriptions"])
 
-else:
-    try:
-        client = get_opensearch_client()
-        indices = list(client.indices.get('*').keys())
-        
-        if indices:
-            selected_index = st.selectbox(
-                "Select an index to query:", 
-                options=indices,
-                help="Choose the OpenSearch index you want to query"
-            )
+# Tab 1: Chat Interface (existing functionality)
+with tab1:
+    st.header("Ask Questions About Your Data")
+    
+    if not openai_api_key:
+        st.error("OPENAI_API_KEY environment variable is not set")
+    else:
+        try:
+            client = get_opensearch_client()
+            indices = list(client.indices.get('*').keys())
             
-            question = st.text_input("Ask a question about your data:", 
-                                    placeholder="Example: What are the top 5 products by sales? or Show me firewall rules")
-            
-            if question and selected_index:
-                with st.container(border=True):
-                    answer = process_question(question, selected_index)
-                    # st.write("### Answer")
-                    # st.write(answer)
-        else:
-            st.error("No indices found in your OpenSearch cluster. Please create at least one index.")
-            
-    except Exception as e:
-        st.error(f"Error connecting to OpenSearch: {str(e)}")
-        st.info("Please ensure all required environment variables are set correctly.")
+            if indices:
+                selected_index = st.selectbox(
+                    "Select an index to query:", 
+                    options=indices,
+                    help="Choose the OpenSearch index you want to query"
+                )
+                
+                question = st.text_input("Ask a question about your data:", 
+                                        placeholder="Example: What are the top 5 products by sales? or Show me firewall rules")
+                
+                if question and selected_index:
+                    with st.container(border=True):
+                        answer = process_question(question, selected_index)
+                        # st.write("### Answer")
+                        # st.write(answer)
+            else:
+                st.error("No indices found in your OpenSearch cluster. Please create at least one index.")
+                
+        except Exception as e:
+            st.error(f"Error connecting to OpenSearch: {str(e)}")
+            st.info("Please ensure all required environment variables are set correctly.")
+
+# Tab 2: Upload Interface
+with tab2:
+    st.header("Upload Rule Descriptions")
+    st.markdown("Process and update rule descriptions in the system.")
+    
+    # Simple upload button
+    if st.button("📤 Upload Descriptions", type="primary", use_container_width=True):
+        with st.spinner("Processing descriptions..."):
+            success = handle_descriptions_upload()
+            if success:
+                st.balloons()
+                st.success("Rule descriptions have been processed and updated successfully!")
+            else:
+                st.error("Failed to process the descriptions.")
+    
 
 st.divider()
