@@ -27,20 +27,31 @@ class OpenAISemanticMatcher:
     @st.cache_resource
     def _get_cached_embeddings(_self, string_array: List[str]) -> np.ndarray:
         """
-        Compute and cache embeddings for the input strings using OpenAI's text-embedding-ada-002.
-        The _self parameter is used to satisfy Streamlit's cache requirements for instance methods.
-
-        Args:
-            string_array: List of strings to embed
-
-        Returns:
-            np.ndarray: Array of embeddings
+        Compute and cache embeddings for the input strings in batches.
         """
-        response = _self.client.embeddings.create(
-            input=string_array,
-            model=_self.model_name
-        )
-        return np.array([item.embedding for item in response.data])
+        print("cache_embedding", len(string_array))
+        
+        batch_size = 1000  # Adjust based on your needs
+        all_embeddings = []
+        
+        for i in range(0, len(string_array), batch_size):
+            batch = string_array[i:i + batch_size]
+            print(f"Processing batch {i//batch_size + 1}/{(len(string_array) + batch_size - 1)//batch_size}")
+            
+            try:
+                response = _self.client.embeddings.create(
+                    input=batch,
+                    model=_self.model_name
+                )
+                batch_embeddings = [item.embedding for item in response.data]
+                all_embeddings.extend(batch_embeddings)
+                
+            except Exception as e:
+                print(f"Error processing batch {i//batch_size + 1}: {e}")
+                # You might want to implement retry logic here
+                raise
+        
+        return np.array(all_embeddings)
 
     def find_top_similar(self, string_array: List[str], query_string: str, top_k: int = 20) -> List[Tuple[str, float]]:
         """

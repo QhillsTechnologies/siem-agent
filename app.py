@@ -165,28 +165,75 @@ def extract_fields_info(properties, parent_prefix=""):
 def clean_json_response(response):
     """
     Cleans the response from LLM to ensure it's valid JSON.
-    Removes markdown code blocks, comments, and extra whitespace while preserving the JSON structure.
+    Attempts to fix common issues like missing closing braces.
     """
-    # Remove markdown code block markers (e.g., ```json or ```)
-    response = re.sub(r'^```(?:json)?\s*\n|\n```$', '', response, flags=re.MULTILINE)
+    try:
+        # Remove markdown code block markers
+        response = re.sub(r'^```(?:json)?\s*\n?|\n?```$', '', response.strip(), flags=re.MULTILINE | re.IGNORECASE)
+        
+        # Remove any comments
+        response = re.sub(r'//.*$', '', response, flags=re.MULTILINE)
+        
+        # Strip whitespace
+        response = response.strip()
+        
+        # Try to parse the response as-is
+        try:
+            json.loads(response)
+            return response
+        except json.JSONDecodeError:
+            # Attempt to fix missing closing braces
+            brace_count = response.count('{') - response.count('}')
+            if brace_count > 0:
+                # Add missing closing braces
+                response += '}' * brace_count
+                try:
+                    json.loads(response)
+                    print(f"Fixed JSON by adding {brace_count} closing brace(s)")
+                    return response
+                except json.JSONDecodeError as e:
+                    print(f"Failed to fix JSON: {e}")
+                    print(f"Repaired response: {repr(response)}")
+            
+            # If parsing still fails, extract the JSON object
+            start = response.find('{')
+            if start == -1:
+                raise ValueError("No JSON object found")
+                
+            # Find the last valid closing brace
+            brace_count = 0
+            end = -1
+            for i in range(start, len(response)):
+                if response[i] == '{':
+                    brace_count += 1
+                elif response[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end = i
+                        break
+            
+            if end == -1:
+                # Try to append closing braces to make it valid
+                response = response[:start] + response[start:] + '}' * brace_count
+                try:
+                    json.loads(response)
+                    print(f"Fixed JSON by appending {brace_count} closing brace(s)")
+                    return response
+                except json.JSONDecodeError as e:
+                    raise ValueError(f"Unable to fix JSON: {e}")
+            
+            json_str = response[start:end + 1]
+            try:
+                json.loads(json_str)
+                return json_str
+            except json.JSONDecodeError as e:
+                raise ValueError(f"Extracted JSON is invalid: {e}")
+                
+    except Exception as e:
+        print(f"JSON cleaning error: {e}")
+        print(f"Raw response: {repr(response)}")
+        raise ValueError(f"Failed to clean JSON response: {e}")
     
-    # Remove any JSON comments (e.g., // comment)
-    response = re.sub(r'//.*$', '', response, flags=re.MULTILINE)
-    
-    # Remove leading/trailing whitespace
-    response = response.strip()
-    
-    # Extract the first valid JSON object (between { and })
-    json_start = response.find('{')
-    json_end = response.rfind('}')
-    
-    if json_start != -1 and json_end != -1 and json_end > json_start:
-        response = response[json_start:json_end+1]
-    else:
-        # If no valid JSON object is found, raise an error
-        raise ValueError("No valid JSON object found in the response")
-    
-    return response
 
 def get_opensearch_client():
     global opensearch_client
@@ -232,24 +279,23 @@ def nl_to_opensearch_query(question, index_name, rule_description=None):
     # Create AutoGen agent
     agent = AssistantAgent(
         name="QueryTranslator",
-        model_client=model_client,
+        model_client=model_client,  # Use the model_client here, not the OpenSearch client
         system_message=f"""
         You are an AI assistant that translates natural language questions into OpenSearch queries.
         
         The OpenSearch index has the following fields and types:
         {fields_info}
-        {rule_context}
         
-        Convert the user's question into a valid OpenSearch query. Focus on creating either:
-        1. A match or multi_match query for simple searches
-        2. A bool query with must/should/must_not for more complex conditions
-        3. Add sort, size, or other parameters as needed
-        4. If a rule description is provided, incorporate it into the search criteria
+        Convert the user's question into a Valid OpenSearch query. Focus on creating either:
+        1. A match or multi_match query for simple searches.
+        2. A bool query with must/should/must_not for more complex conditions.
+        3. Only include sort, size if explicitly specified in the input otherwise do not mention it.
         
         Return ONLY a valid JSON string containing the OpenSearch query body, with no additional text, code fences, or comments.
         
         Rules:
-        - Output MUST be a single-line, valid JSON string with no newlines or extra text.
+        - Output MUST be a single-line, VALID JSON string with no newlines or extra text.
+        - Always include the "query" wrapper object.
         - Properly escape special characters (e.g., quotes as \", newlines as \\n).
         - Do NOT include any additional text, comments, or formatting outside the JSON string.
         """
@@ -266,7 +312,7 @@ def nl_to_opensearch_query(question, index_name, rule_description=None):
     
     # Prompt for the agent
     prompt = f"""
-    Convert the following natural language question into a valid OpenSearch query:
+    Convert the following natural language question into a Valid OpenSearch query:
     
     Question: {question}
     {rule_prompt_context}
@@ -274,7 +320,7 @@ def nl_to_opensearch_query(question, index_name, rule_description=None):
     Index fields and types:
     {json.dumps(fields_info, indent=2)}
     
-    Return ONLY a valid JSON string containing the OpenSearch query body, with no additional text, code fences, or comments.
+    Return ONLY a VALID JSON string containing the OpenSearch query body, with no additional text, code fences, or comments.
     """
     
     # Run the agent
@@ -286,9 +332,13 @@ def nl_to_opensearch_query(question, index_name, rule_description=None):
     try:
         result = asyncio.run(run_agent())
         response = result.messages[1].content
+        print("ressponse: ",response)
         cleaned_response = clean_json_response(response)
+        print("cleaned response",cleaned_response)
         if cleaned_response:
+            print("json.loads(cleaned_response): ",json.loads(cleaned_response))
             return json.loads(cleaned_response)
+
         else:
             st.error("Failed to parse the generated OpenSearch query")
             return None
@@ -387,28 +437,28 @@ def process_question(question, selected_index):
         
         st.write("Translating to OpenSearch query...")
         query = nl_to_opensearch_query(question, selected_index, relevant_rule_description)
-        
+        print("query: ",query)
         if query:
             st.write("Query generated:")
             st.code(json.dumps(query, indent=2))
             
-            st.write("Executing search...")
-            try:
-                client = get_opensearch_client()
-                results = client.search(
-                    body=query,
-                    index=selected_index
-                )
+            # st.write("Executing search...")
+            # try:
+            #     client = get_opensearch_client()
+            #     results = client.search(
+            #         body=query,
+            #         index=selected_index
+            #     )
                 
-                st.write("Generating natural language response...")
-                response = format_results_as_natural_language(results, question, relevant_rule_description)
-                status.update(label="Complete!", state="complete")
-                return response
+            #     st.write("Generating natural language response...")
+            #     response = format_results_as_natural_language(results, question, relevant_rule_description)
+            #     status.update(label="Complete!", state="complete")
+            #     return response
                 
-            except Exception as e:
-                st.error(f"Error executing OpenSearch query: {str(e)}")
-                status.update(label="Error occurred", state="error")
-                return f"Error: {str(e)}"
+            # except Exception as e:
+            #     st.error(f"Error executing OpenSearch query: {str(e)}")
+            #     status.update(label="Error occurred", state="error")
+            #     return f"Error: {str(e)}"
         else:
             status.update(label="Failed to generate query", state="error")
             return "I couldn't translate your question into a valid OpenSearch query. Please try rephrasing or check your configuration."
@@ -437,8 +487,8 @@ else:
             if question and selected_index:
                 with st.container(border=True):
                     answer = process_question(question, selected_index)
-                    st.write("### Answer")
-                    st.write(answer)
+                    # st.write("### Answer")
+                    # st.write(answer)
         else:
             st.error("No indices found in your OpenSearch cluster. Please create at least one index.")
             
