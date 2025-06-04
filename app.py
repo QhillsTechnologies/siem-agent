@@ -309,7 +309,7 @@ def nl_to_opensearch_query(question, index_name, rule_description=None):
         Convert the user's question into a Valid OpenSearch query. Focus on creating either:
         1. A match or multi_match query for simple searches.
         2. A bool query with must/should/must_not for more complex conditions.
-        3. Only include sort, size if explicitly specified in the input otherwise do not mention it.
+        3. Only include sort, size if explicitly specified in the input otherwise Strictly DO NOT mention it.
         
         Return ONLY a valid JSON string containing the OpenSearch query body, with no additional text, code fences, or comments.
         
