@@ -448,6 +448,7 @@ def deep_research_query_generation(question, index_name, rule_description=None, 
                 3. Adding appropriate filters when beneficial
                 4. Balancing precision and recall
                 5. Proper handling of nested fields if present
+                6. Only include sort, size if explicitly specified in the input otherwise Strictly DO NOT mention it.
                 
                 Return JSON with:
                 {{
