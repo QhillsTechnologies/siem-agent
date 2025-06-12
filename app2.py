@@ -273,37 +273,75 @@ def get_opensearch_client():
 def analyze_fields_for_query(fields_info, question):
     """
     Analyze which fields are most relevant for the given question.
-    Returns categorized field information for better query construction.
+    Returns both must-have fields and most relevant fields based on question analysis.
     """
     agent = AssistantAgent(
         name="FieldAnalyzer",
         model_client=model_client,
         system_message=f"""
-        You are an expert at analyzing database schema and determining which fields are most relevant for search queries.
+        You are a database field selection expert. Your task is to analyze user questions and categorize fields into two distinct categories based on query requirements.
         
         Available fields and their types:
         {json.dumps(fields_info, indent=2)}
         
-        Categorize the fields into:
-        1. TEXT_FIELDS: Fields that contain searchable text content (type: text, keyword with text-like names)
-        2. FILTER_FIELDS: Fields good for filtering (dates, numbers, exact matches, IDs)
-        3. NESTED_FIELDS: Complex nested objects that might need special handling
-        4. RELEVANT_FIELDS: Fields that seem most relevant to the user's question
+        FIELD CATEGORIZATION FRAMEWORK:
         
-        Return a JSON response with field categorization and reasoning.
+        MUST_FIELDS - Fields that represent EXACT REQUIREMENTS:
+        - Fields containing specific identifiers, codes, names, or exact values explicitly mentioned in the question
+        - Fields that represent mandatory filtering criteria with concrete values
+        - Fields that must match exactly for the query to be meaningful
+        - Leave EMPTY if the question contains no specific identifiers or exact values
+        
+        MOST_RELEVANT_FIELDS - Fields that contain the PRIMARY INFORMATION needed:
+        - Fields that hold the core data required to answer the question
+        - Fields that provide essential context for a complete response  
+        - Fields that directly relate to the information being sought
+        - Always select exactly THREE fields for optimal relevance scoring
+        
+        SELECTION PRINCIPLES:
+        - MUST_FIELDS: Only populate when question contains concrete, specific references
+        - MOST_RELEVANT_FIELDS: Focus on fields containing the actual answer data
+        - All selected fields must exist in the provided schema
+        - Prioritize fields that directly address the user's information needs
+        - Be extremely strict about MUST_FIELDS - only include for explicit value matches
+        
+        OUTPUT FORMAT:
+        Return a JSON object with exactly this structure:
+        {{
+            "MUST_FIELDS": ["field1", "field2"],
+            "MOST_RELEVANT_FIELDS": ["field1", "field2", "field3"]
+        }}
         """
     )
     
     prompt = f"""
-    Analyze these fields for the question: "{question}"
+    User Question: "{question}"
     
-    Categorize the fields and identify:
-    1. Which fields likely contain searchable text content
-    2. Which fields are good for filtering/exact matching  
-    3. Which fields are most relevant to this specific question
-    4. Any nested fields that need special handling
+    ANALYSIS PROCESS:
     
-    Return JSON with your analysis and reasoning.
+    1. QUESTION DECOMPOSITION:
+    - Identify what specific information the user is requesting
+    - Detect any explicit identifiers, codes, names, or exact values mentioned
+    - Determine what type of data would constitute a complete answer
+    
+    2. MUST_FIELDS DETERMINATION:
+    - Scan for SPECIFIC references to identifiers, codes, names, or exact values
+    - Map explicit terms in the question to corresponding field names
+    - Only include fields when question contains concrete, specific values
+    - If question is general or conceptual, keep MUST_FIELDS empty
+    
+    3. MOST_RELEVANT_FIELDS SELECTION:
+    - Identify fields containing the primary information needed for the answer
+    - Select fields that provide necessary context and details
+    - Choose exactly three fields that best address the question requirements
+    - Focus on fields that contain the actual answer data
+    
+    4. VALIDATION:
+    - Ensure all selected fields exist in the provided schema
+    - Verify field selections align with question requirements
+    - Maintain strict criteria for MUST_FIELDS inclusion
+    
+    Analyze the question and return the JSON response with both field categories.
     """
     
     async def run_analysis():
@@ -314,12 +352,31 @@ def analyze_fields_for_query(fields_info, question):
         result = asyncio.run(run_analysis())
         response = result.messages[1].content
         cleaned_response = clean_json_response(response)
-        return json.loads(cleaned_response)
+        analysis = json.loads(cleaned_response)
+        
+        # Extract both must fields and most relevant fields from the original fields_info
+        must_fields = analysis.get('MUST_FIELDS', [])
+        most_relevant_fields = analysis.get('MOST_RELEVANT_FIELDS', [])
+        
+        # Combine and create relevant fields info
+        all_selected_fields = list(set(must_fields + most_relevant_fields))
+        relevant_fields_info = {
+            field: fields_info[field] 
+            for field in all_selected_fields 
+            if field in fields_info
+        }
+        
+        # Return both the categorized fields and the field info
+        return {
+            'categorized_fields': analysis,
+            'relevant_fields_info': relevant_fields_info
+        }
+        
     except Exception as e:
         st.error(f"Error analyzing fields: {str(e)}")
         return None
 
-# Function to translate natural language to OpenSearch query using AutoGen
+
 def deep_research_query_generation(question, index_name, rule_description=None, max_iterations=3):
     """
     Enhanced query generation with iterative refinement like ChatGPT Deep Research
@@ -337,21 +394,28 @@ def deep_research_query_generation(question, index_name, rule_description=None, 
     # Step 1: Analyze fields for relevance
     st.write("🔍 **Step 1**: Analyzing field relevance...")
     field_analysis = analyze_fields_for_query(fields_info, question)
+    print("field_analysis:  ",field_analysis)
     
     if field_analysis:
         st.write("📊 **Field Analysis Complete**:")
-        if 'relevant_fields' in field_analysis:
-            st.write(f"• Most relevant fields: {', '.join(field_analysis.get('relevant_fields', []))}")
-        if 'text_fields' in field_analysis:
-            st.write(f"• Text searchable fields: {', '.join(field_analysis.get('text_fields', []))}")
+        categorized_fields = field_analysis.get('categorized_fields', {})
+        must_fields = categorized_fields.get('MUST_FIELDS', [])
+        relevant_fields = categorized_fields.get('MOST_RELEVANT_FIELDS', [])
+        
+        if must_fields:
+            st.write(f"• Must-have fields: {', '.join(must_fields)}")
+        if relevant_fields:
+            st.write(f"• Most relevant fields: {', '.join(relevant_fields)}")
     
     # Rule context
     rule_context = ""
     if rule_description:
         rule_context = f"""
-        IMPORTANT CONTEXT: This question relates to the rule description: "{rule_description}"
-        Include this rule description in your search strategy.
+        RULE SPECIFICATION: A specific rule is provided: "{rule_description}"
+        When rule_description is provided, create exact match query for rule.description field.
+        Use term query for precise rule matching without wildcards or complex clauses.
         """
+        print('rule_content: ',rule_context)
     
     # Step 2: Generate initial query with deep thinking
     st.write("🧠 **Step 2**: Generating query with deep analysis...")
@@ -360,49 +424,79 @@ def deep_research_query_generation(question, index_name, rule_description=None, 
         name="DeepQueryThinker",
         model_client=model_client,
         system_message=f"""
-        You are an expert OpenSearch query architect that thinks deeply about query construction.
+        You are an OpenSearch query builder that creates bool queries based on field categorization analysis.
+
+        **Field analysis:** {json.dumps(field_analysis, indent=2) if field_analysis else "No analysis available"}
+
+        **QUERY CONSTRUCTION LOGIC:**
         
-        Available fields: {json.dumps(fields_info, indent=2)}
-        Field analysis: {json.dumps(field_analysis, indent=2) if field_analysis else "No analysis available"}
+        MUST CLAUSE USAGE:
+        - Only Include MUST_FIELDS in the "must" clause for exact matching requirements
+        - Use when specific identifiers or exact values need to be matched
+        - These are mandatory conditions that must be satisfied
         
-        Your process:
-        1. UNDERSTAND: Break down what the user is really asking for
-        2. STRATEGIZE: Determine the best search strategy (exact match, fuzzy search, range, etc.)
-        3. PRIORITIZE: Focus on the most relevant fields based on the question
-        4. CONSTRUCT: Build an optimized OpenSearch query
-        5. VALIDATE: Ensure the query syntax is correct
+        SHOULD CLAUSE USAGE:
+        - Include MOST_RELEVANT_FIELDS in the "should" clause for relevance scoring
+        - Always set "minimum_should_match": 1 when using should clauses
+        - These conditions improve relevance but are not mandatory
         
-        For text searches, prioritize:
-        - Fields likely to contain the relevant text content
-        - Use multi_match for searching across multiple text fields
-        - Use match_phrase for exact phrase matching when appropriate
-        - Use wildcard or fuzzy queries for partial matches
-        - Always include the "query" wrapper object.
+        QUERY TYPE SELECTION:
+        - term: For exact identifiers, IDs, and categorical values
+        - match: For flexible text searches with analysis
+        - range: For numerical thresholds and date ranges
         
-        Return your thinking process AND the final query as JSON:
+        FIELD NAME HANDLING:
+        - Use exact field names from field analysis without modification
+        - Do not add or remove any suffixes from field names
+        - Use field names exactly as they appear in the mapping
+
+        STRUCTURE REQUIREMENTS:
+        - MUST start with {{"query": {{"bool": {{...}}}}}} structure
+        - Use bool query structure with appropriate must/should clauses
+        - Only use fields that exist in the field analysis
+        - Do not include sort or size parameters
+        - When using should clauses, always include "minimum_should_match": 1
+        
+        **Return JSON with:**
         {{
-            "thinking_process": "Your step-by-step reasoning...",
-            "search_strategy": "The strategy you chose and why...",
-            "field_selection_reasoning": "Why you selected specific fields...", 
-            "query": {{...opensearch query...}}
+            "thinking_process": "Brief explanation of your query structure approach",
+            "query": {{your OpenSearch query}}
         }}
         """
     )
     
     deep_prompt = f"""
-    Question: {question}
-    {rule_context}
+    **Question:** {question}  
+    **Field Analysis:** {json.dumps(field_analysis, indent=2) if field_analysis else "No analysis"}
+    **Rule description:** {rule_description if rule_description else "None"}
+
+    Create an OpenSearch bool query following this structure logic:
     
-    Think deeply about this query:
+    1. **MUST CLAUSE CONSTRUCTION:**
+    - If MUST_FIELDS are present, then and then only place them in the "must" clause
+    - Use appropriate query types for exact matching
+    - These represent mandatory filtering conditions
     
-    1. What is the user REALLY trying to find?
-    2. Which fields are most likely to contain the answer?
-    3. What type of search strategy fits best?
-    4. How can I make this search both comprehensive and precise?
+    2. **SHOULD CLAUSE CONSTRUCTION:**
+    - Place MOST_RELEVANT_FIELDS in the "should" clause
+    - Always include "minimum_should_match": 1
+    - These improve relevance scoring for better results
     
-    Focus especially on text-searchable fields for content-based queries.
+    3. **QUERY TYPE DETERMINATION:**
+    - Analyze field content to select optimal query type
+    - Use term for exact values, match for text, range for numbers
+    - Ensure field names match exactly those in field analysis
     
-    Provide your complete thinking process and the optimized OpenSearch query.
+    4. **RULE INTEGRATION:**
+    - When rule_description is provided, Always include exact match condition in should clause
+    - Use term query for "rule.description" field matching
+    
+    5. **VALIDATION:**
+    - Only use field names present in the field analysis
+    - MUST start with {{"query": {{"bool": {{...}}}}}} structure
+    - Include "minimum_should_match" : 1 when using should clauses
+    
+    Build the query structure based on the field categorization and question intent.
     """
     
     async def run_deep_thinking():
@@ -419,14 +513,6 @@ def deep_research_query_generation(question, index_name, rule_description=None, 
         if 'thinking_process' in deep_analysis:
             st.write("💭 **Thinking Process**:")
             st.write(deep_analysis['thinking_process'])
-            
-        if 'search_strategy' in deep_analysis:
-            st.write("🎯 **Search Strategy**:")
-            st.write(deep_analysis['search_strategy'])
-            
-        if 'field_selection_reasoning' in deep_analysis:
-            st.write("📋 **Field Selection**:")
-            st.write(deep_analysis['field_selection_reasoning'])
         
         initial_query = deep_analysis.get('query', {})
         
@@ -440,38 +526,78 @@ def deep_research_query_generation(question, index_name, rule_description=None, 
                 name="QueryRefiner",
                 model_client=model_client,
                 system_message=f"""
-                You are a query optimization expert. Review and improve OpenSearch queries.
+                You optimize OpenSearch bool queries by ensuring proper must/should clause structure and field usage.
+
+                **Field analysis:** {json.dumps(field_analysis, indent=2)}
+
+                **OPTIMIZATION REQUIREMENTS:**
                 
-                Focus on:
-                1. Ensuring all relevant text fields are included in searches
-                2. Optimizing search clauses for better relevance
-                3. Adding appropriate filters when beneficial
-                4. Balancing precision and recall
-                5. Proper handling of nested fields if present
-                6. Only include sort, size if explicitly specified in the input otherwise Strictly DO NOT mention it.
+                MUST CLAUSE OPTIMIZATION:
+                - Ensure Only MUST_FIELDS are properly placed in "must" clause
+                - Use appropriate query types for exact matching
+                - Validate these represent mandatory conditions
                 
-                Return JSON with:
+                SHOULD CLAUSE OPTIMIZATION:
+                - Ensure MOST_RELEVANT_FIELDS are in "should" clause
+                - Always include "minimum_should_match": 1
+                - Optimize for relevance scoring
+                
+                QUERY TYPE OPTIMIZATION:
+                - term: For exact identifiers and categorical values
+                - match_phrase: For descriptive text matching
+                - match: For flexible text searches
+                - range: For numerical thresholds and dates
+                
+                STRUCTURE VALIDATION:
+                - Maintain proper bool query structure
+                - MUST start with {{"query": {{"bool": {{...}}}}}} structure
+                - Validate all fields exist in field analysis
+                - Remove redundant or conflicting clauses
+                - Ensure minimum_should_match is set when using should clauses
+                
+                **Return JSON:**
                 {{
-                    "improvements_made": "List of specific improvements...",
+                    "improvements_made": "Description of optimizations applied",
                     "confidence_score": 0.0-1.0,
-                    "refined_query": {{...improved query...}},
+                    "refined_query": {{optimized query}},
                     "needs_further_refinement": true/false
                 }}
                 """
             )
             
             refinement_prompt = f"""
-            Original question: {question}
+            Question: {question}
             Current query: {json.dumps(current_query, indent=2)}
-            Available fields: {json.dumps(fields_info, indent=2)}
+            Field analysis: {json.dumps(field_analysis, indent=2) if field_analysis else "No analysis"}
+            Rule description: {rule_description if rule_description else "None"}
             
-            Analyze and improve this query. Consider:
-            1. Are we searching the right fields?
-            2. Is the search strategy optimal?
-            3. Are we missing any important text fields?
-            4. Can we improve relevance scoring?
+            Optimize this OpenSearch query by:
             
-            Provide specific improvements and the refined query.
+            1. **MUST CLAUSE VALIDATION:**
+            - Ensure MUST_FIELDS are correctly placed in "must" clause
+            - Verify appropriate query types for exact matching
+            - Confirm mandatory conditions are properly structured
+            
+            2. **SHOULD CLAUSE VALIDATION:**
+            - Ensure MOST_RELEVANT_FIELDS are in "should" clause
+            - Verify "minimum_should_match": 1 is included 
+            
+            3. **QUERY TYPE OPTIMIZATION:**
+            - Validate query types match field content and purpose
+            - Ensure optimal matching behavior for each field
+            - Remove inefficient query constructions
+
+            4. **RULE INTEGRATION:**
+            - When rule description is provided, Always include exact match condition in should clause
+            - Use term query for rule.description field matching
+            
+            5. **STRUCTURE REFINEMENT:**
+            - MUST start with {{"query": {{"bool": {{...}}}}}} structure
+            - Eliminate redundant or conflicting clauses
+            - Ensure all fields exist in field analysis
+            - Keep focus on user's specific question intent
+            
+            Apply optimizations to improve query effectiveness and structure.
             """
             
             async def run_refinement():
@@ -504,6 +630,7 @@ def deep_research_query_generation(question, index_name, rule_description=None, 
                 st.write(f"⚠️ Refinement iteration {iteration + 1} failed: {str(e)}")
                 break
         
+        # Final validation
         st.write("🎯 **Final Optimized Query**:")
         st.code(json.dumps(current_query, indent=2))
         
@@ -512,6 +639,7 @@ def deep_research_query_generation(question, index_name, rule_description=None, 
     except Exception as e:
         st.error(f"Error in deep research query generation: {str(e)}")
         return None
+
 
 # Main application logic
 def process_question_enhanced(question, selected_index):
